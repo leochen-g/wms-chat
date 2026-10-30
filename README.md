@@ -17,10 +17,10 @@
 ## 安装
 
 ```bash
-# 推荐：从 Git 仓库安装（可用 hermes plugins update 更新）
-hermes plugins install <owner>/wms-chat
-# 或完整 URL（私有仓库 / 自建 Git）
-hermes plugins install https://git.example.com/team/wms-chat.git
+# 推荐：从 GitHub 安装（可用 hermes plugins update wms-chat 更新）
+hermes plugins install leochen-g/wms-chat
+# 或完整 URL
+hermes plugins install https://github.com/leochen-g/wms-chat.git
 
 hermes plugins enable wms-chat
 ```
@@ -35,8 +35,7 @@ hermes plugins enable wms-chat
 
 ```bash
 WMS_CHAT_API_KEY=your-api-key
-WMS_CHAT_ALLOWED_USERS=wxid_aaa,wxid_bbb
-WMS_CHAT_HOME_CHANNEL=wxid_aaa          # cron / 通知的默认投递目标
+WMS_CHAT_HOME_CHANNEL=wxid_aaa          # 可选：cron / 通知的默认投递目标
 ```
 
 ### 环境变量
@@ -47,9 +46,8 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # cron / 通知的默认投递目标
 |---|---|---|
 | `WMS_CHAT_API_KEY` | — | **必填**。微秘书 apiKey |
 | `WMS_CHAT_API_BASE_URL` | `https://api-bot.aibotk.com` | 后端地址 |
-| `WMS_CHAT_ALLOWED_USERS` | — | 允许和 agent 对话的 wxid，逗号分隔（Hermes 授权层读取） |
-| `WMS_CHAT_ALLOW_ALL_USERS` | `false` | 允许任何人（仅开发用） |
-| `WMS_CHAT_GROUP_ALLOWED_CHATS` | — | 按群授权，值为 `group:<roomid>`，逗号分隔；该群内任何人都可触发 |
+| `WMS_CHAT_ALLOWED_USERS` | 空 = 不限制 | 限定可触发 agent 的 wxid，逗号分隔，支持 `*`。**只按 wxid 匹配，不看昵称**（昵称可被任意修改） |
+| `WMS_CHAT_GROUP_ALLOWED_CHATS` | — | 设了 `ALLOWED_USERS` 后，这些群（`group:<roomid>`，逗号分隔）内任何人仍可触发 |
 | `WMS_CHAT_REQUIRE_MENTION` | `false` | 群消息是否必须 @机器人。默认 `false`：不 @ 也会收到 |
 | `WMS_CHAT_FREE_RESPONSE_GROUPS` | — | `REQUIRE_MENTION=true` 时仍无需 @ 的群 ID（不带 `group:` 前缀） |
 | `WMS_CHAT_GROUP_POLICY` | `open` | `open` / `allowlist` / `disabled` |
@@ -59,12 +57,21 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # cron / 通知的默认投递目标
 | `WMS_CHAT_MAX_RECONNECT_ATTEMPTS` | `10` | MQTT 最大重连次数 |
 | `WMS_CHAT_RECONNECT_BASE_DELAY` | `2` | 重连基础延迟（秒，指数退避，上限 60） |
 
-### 授权：两层，别搞混
+### 默认范围：所有好友、所有群
 
-1. **插件层（本插件）**：`GROUP_POLICY` / `GROUPS` / `GROUP_ALLOW_FROM` / `REQUIRE_MENTION` 决定**哪些群消息会被送进 agent**。
-2. **Hermes 网关层**：`ALLOWED_USERS` / `ALLOW_ALL_USERS` / `GROUP_ALLOWED_CHATS` 决定**谁有权限和 agent 对话**。
+插件以 `trusted_inbound` 注册，Hermes 网关**不再**要求白名单或配对码。只要 `WMS_CHAT_API_KEY` 配好，机器人账号下的**所有好友**和**所有群的所有成员**都能和 agent 对话。启动时日志会提示这一点。
 
-群里的人要触发 agent，两层都要通过：要么发送者在 `WMS_CHAT_ALLOWED_USERS` 里，要么该群在 `WMS_CHAT_GROUP_ALLOWED_CHATS` 里。私聊陌生人默认会收到 Hermes 的配对码流程；设了 `ALLOWED_USERS` 后陌生人不再收到配对码。
+> ⚠️ 这意味着任何能给这个微信号发消息的人，都能让你的 agent 执行它被允许的操作（包括终端、文件等工具）。如果 agent 开了高权限工具，请务必收紧范围。
+
+收紧范围，按需组合（全部在插件的 `inbound.admit` 里执行）：
+
+| 目标 | 配置 |
+|---|---|
+| 只允许指定的人（好友 + 群成员） | `WMS_CHAT_ALLOWED_USERS=wxid_a,wxid_b` |
+| 只开放指定的群 | `WMS_CHAT_GROUP_POLICY=allowlist` + `WMS_CHAT_GROUPS=roomid1,roomid2` |
+| 指定人 + 某些群里任何人都行 | `WMS_CHAT_ALLOWED_USERS=...` + `WMS_CHAT_GROUP_ALLOWED_CHATS=group:roomid1` |
+| 禁用所有群 | `WMS_CHAT_GROUP_POLICY=disabled` |
+| 群内只允许指定发送者 | `WMS_CHAT_GROUP_ALLOW_FROM=wxid_a,Alice`（可按 wxid 或昵称，仅作群内附加过滤） |
 
 ### 群聊不 @ 也能收到
 
@@ -149,5 +156,6 @@ HERMES_HOME=/tmp/h PYTHONPATH=<hermes-agent 源码目录> python tests/test_e2e.
 ## 已知限制
 
 - 入站的名片 / h5 链接 / 视频号 / 位置只以 `content` 描述文字传给 agent，`mediaInfo` 未做结构化处理。
+- 因为是 `trusted_inbound`，Hermes 的配对码（pairing）和 `unauthorized_dm_behavior` 对本平台不生效。
 - 同一 apiKey 同一时刻只能由一个 Hermes profile 连接（MQTT clientId 相同会互相踢下线），插件用 scoped lock 保护。
 - allowlist 群首次被拦截时不会向群里发提醒（OpenClaw 版有）。

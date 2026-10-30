@@ -26,7 +26,7 @@ class _Ctx:
             install_hint=install_hint, source="plugin", **kw))
 pkg.register(_Ctx())
 entry = platform_registry.get("wms_chat")
-assert entry and entry.group_allowed_chats_env == "WMS_CHAT_GROUP_ALLOWED_CHATS"
+assert entry and entry.trusted_inbound is True and entry.group_allowed_chats_env == "WMS_CHAT_GROUP_ALLOWED_CHATS"
 
 # 测试服务在回环地址上，Hermes 的 SSRF 防护会拦截；仅在测试里放行（生产路径不变）
 import httpx, tools.url_safety as _us
@@ -79,6 +79,22 @@ def unit_tests():
     assert inbound.admit(S(group_allow_from="*"), msg(**g)) is None
     assert inbound.admit(S(), msg(isMyself=True)) == "self_echo"
     assert inbound.admit(S(), msg(senderId="wxid_bot")) == "self_echo"
+    # 默认范围：所有好友、所有群
+    assert S().allowed_users == frozenset()
+    assert inbound.admit(S(), msg(senderId="wxid_stranger")) is None
+    assert inbound.admit(S(), msg(senderId="wxid_stranger", **g)) is None
+    # allowed_users：只按 wxid 匹配，昵称不能冒充
+    a1 = S(allowed_users="wxid_u")
+    assert inbound.admit(a1, msg()) is None and inbound.admit(a1, msg(**g)) is None
+    assert inbound.admit(a1, msg(senderId="wxid_x")) == "sender_not_allowed"
+    assert inbound.admit(a1, msg(senderId="wxid_x", **g)) == "sender_not_allowed"
+    assert inbound.admit(a1, msg(senderId="wxid_x", senderName="wxid_u")) == "sender_not_allowed"
+    assert inbound.admit(S(allowed_users="*"), msg(senderId="wxid_x")) is None
+    # 整群授权：限定了 allowed_users 后，该群任何人仍可触发
+    a2 = S(allowed_users="wxid_u", group_allowed_chats="group:r1")
+    assert inbound.admit(a2, msg(senderId="wxid_x", **g)) is None
+    assert inbound.admit(a2, msg(senderId="wxid_x", **{**g, "groupId": "r2"})) == "sender_not_allowed"
+    assert inbound.admit(a2, msg(senderId="wxid_x")) == "sender_not_allowed"  # 私聊不受群授权影响
     # .env 读取（env 优先于 YAML）
     os.environ["WMS_CHAT_REQUIRE_MENTION"] = "true"; os.environ["WMS_CHAT_GROUPS"] = "a, b"
     os.environ["WMS_CHAT_GROUP_POLICY"] = "allowlist"

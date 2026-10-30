@@ -22,15 +22,11 @@ optional_env:
     prompt: "API base URL"
     password: false
   - name: WMS_CHAT_ALLOWED_USERS
-    description: "允许触发 agent 的 wxid，逗号分隔"
-    prompt: "Allowed wxids (comma-separated)"
-    password: false
-  - name: WMS_CHAT_ALLOW_ALL_USERS
-    description: "允许任何人触发（仅开发用）"
-    prompt: "Allow all users? (true/false)"
+    description: "限定可触发 agent 的 wxid，逗号分隔，支持 *。留空 = 所有好友、所有群成员（默认）"
+    prompt: "Restrict to wxids (comma-separated, empty = everyone)"
     password: false
   - name: WMS_CHAT_GROUP_ALLOWED_CHATS
-    description: "按群授权：group:<roomid>，逗号分隔，该群内任何人都可触发"
+    description: "设了 ALLOWED_USERS 后，这些群（group:<roomid>，逗号分隔）内任何人仍可触发"
     prompt: "Allowed group chats (group:<roomid>, comma-separated)"
     password: false
   - name: WMS_CHAT_REQUIRE_MENTION

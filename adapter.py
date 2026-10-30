@@ -83,6 +83,11 @@ class WmsChatAdapter(BasePlatformAdapter):
             return False
         self._mark_connected()
         self._wire_plugin_handlers(None)
+        if not self._s.allowed_users:
+            logger.warning(
+                "[wms_chat] open access: any WeChat friend and any member of any group can talk to the "
+                "agent. Set WMS_CHAT_ALLOWED_USERS (wxid list) to restrict."
+            )
         return True
 
     async def disconnect(self) -> None:
@@ -279,5 +284,7 @@ def register(ctx) -> None:
         standalone_sender_fn=_standalone_send,
         max_message_length=4000, emoji="💬", allow_update_command=True,
         platform_hint=PLATFORM_HINT,
+        # 准入由本插件的 inbound.admit 决定（默认所有好友/所有群），网关不再要求白名单或配对码
+        trusted_inbound=True,
         **gateway_env.AUTHZ,
     )

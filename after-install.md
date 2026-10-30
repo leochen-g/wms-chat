@@ -10,11 +10,12 @@ hermes plugins enable wms-chat
 
 ```bash
 WMS_CHAT_API_KEY=你的apiKey
-# 谁可以和 agent 对话（二选一）
-WMS_CHAT_ALLOWED_USERS=wxid_xxx,wxid_yyy      # 私聊白名单
-# WMS_CHAT_ALLOW_ALL_USERS=true               # 仅开发用
-# 群聊：整群授权，该群内任何人都可触发
-# WMS_CHAT_GROUP_ALLOWED_CHATS=group:roomid_xxx
+# 默认：所有好友、所有群都可以和 agent 对话（无需配对码）。
+# 想限制范围时再设置：
+# WMS_CHAT_ALLOWED_USERS=wxid_xxx,wxid_yyy    # 只允许这些 wxid（好友和群成员都按它过滤）
+# WMS_CHAT_GROUP_ALLOWED_CHATS=group:roomid_xxx   # 限定后，这些群内任何人仍可触发
+# WMS_CHAT_GROUP_POLICY=allowlist
+# WMS_CHAT_GROUPS=roomid_xxx                  # 只开放这些群
 ```
 
 **3. 启动**
@@ -24,4 +25,4 @@ hermes gateway run
 ```
 
 首次连接会自动安装 `paho-mqtt`。群消息默认**不需要 @机器人**；想改成必须 @，设置 `WMS_CHAT_REQUIRE_MENTION=true`。
-完整配置见插件目录下的 `README.md`。
+完整配置见 [README](https://github.com/leochen-g/wms-chat#readme)。

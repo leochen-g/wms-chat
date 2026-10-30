@@ -1,7 +1,8 @@
 """入站：解析 MQTT 消息、群/私聊准入判断。纯函数，便于单测。
 
-群消息默认 **不需要 @机器人**（require_mention=false）。准入链：
-  group_policy(open|allowlist|disabled) -> group_allow_from -> require_mention(+免@群)
+默认范围：所有好友、所有群。群消息默认 **不需要 @机器人**（require_mention=false）。准入链：
+  group_policy(open|allowlist|disabled) -> allowed_users(默认空=不限) -> group_allow_from -> require_mention(+免@群)
+allowed_users 只按 senderId(wxid) 匹配：昵称可被任意修改，不能用于授权。
 群里没 @ 的消息会带 ``reply_expected=False`` 交给 agent，agent 判断无需回复时可保持沉默。
 """
 
@@ -34,17 +35,26 @@ def match_list(entries, *candidates: str) -> bool:
     return any(c and c.lower() in entries for c in candidates)
 
 
+def sender_allowed(s: WmsChatSettings, m: dict[str, Any]) -> bool:
+    """allowed_users 为空 = 不限制；否则只按 senderId 精确匹配（大小写不敏感，``*`` 通配）。"""
+    return not s.allowed_users or match_list(s.allowed_users, m["senderId"])
+
+
 def admit(s: WmsChatSettings, m: dict[str, Any]) -> Optional[str]:
     """None=放行；否则返回拒绝原因（用于 debug 日志）。DM 授权交给 Hermes 网关。"""
     if m.get("isMyself") is True or m["senderId"] == m["robotId"]:
         return "self_echo"
     if not m.get("isGroup"):
-        return None
+        return None if sender_allowed(s, m) else "sender_not_allowed"
     group_id = m.get("groupId") or ""
     if s.group_policy == "disabled":
         return "group_disabled"
     if s.group_policy == "allowlist" and group_id not in s.groups:
         return "group_not_allowlisted"
+    if group_id in s.group_allowed_chats:
+        pass  # 整群授权：跳过 allowed_users
+    elif not sender_allowed(s, m):
+        return "sender_not_allowed"
     if s.group_allow_from and not match_list(s.group_allow_from, m["senderId"], m.get("senderName", "")):
         return "sender_not_allowed"
     if s.require_mention and group_id not in s.free_response_groups and not is_mentioned(m):
