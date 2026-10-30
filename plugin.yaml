@@ -1,0 +1,59 @@
+name: wms-chat
+label: 微秘书 (WMS Chat)
+kind: platform
+version: 0.2.0
+description: >
+  微秘书 (WeChat) gateway adapter for Hermes Agent. Gets MQTT parameters from the
+  WMS backend, subscribes to the receive topic, and publishes replies to the send
+  topic. Supports private chats, groups (with or without @mention), and inbound
+  image / video / voice / file localization.
+author: wms
+python_dependencies:
+  - "paho-mqtt>=1.6,<3"
+requires_env:
+  - name: WMS_CHAT_API_KEY
+    description: "微秘书个人中心 apiKey"
+    prompt: "微秘书 apiKey"
+    url: "https://wechat.aibotk.com/user/info"
+    password: true
+optional_env:
+  - name: WMS_CHAT_API_BASE_URL
+    description: "后端地址，默认 https://api-bot.aibotk.com"
+    prompt: "API base URL"
+    password: false
+  - name: WMS_CHAT_ALLOWED_USERS
+    description: "允许触发 agent 的 wxid，逗号分隔"
+    prompt: "Allowed wxids (comma-separated)"
+    password: false
+  - name: WMS_CHAT_ALLOW_ALL_USERS
+    description: "允许任何人触发（仅开发用）"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: WMS_CHAT_GROUP_ALLOWED_CHATS
+    description: "按群授权：group:<roomid>，逗号分隔，该群内任何人都可触发"
+    prompt: "Allowed group chats (group:<roomid>, comma-separated)"
+    password: false
+  - name: WMS_CHAT_REQUIRE_MENTION
+    description: "群消息是否必须 @机器人（默认 false：不 @ 也会收到）"
+    prompt: "Require @mention in groups? (true/false)"
+    password: false
+  - name: WMS_CHAT_FREE_RESPONSE_GROUPS
+    description: "require_mention=true 时仍无需 @ 的群 ID，逗号分隔"
+    prompt: "Free-response group ids"
+    password: false
+  - name: WMS_CHAT_GROUP_POLICY
+    description: "open | allowlist | disabled（默认 open）"
+    prompt: "Group policy"
+    password: false
+  - name: WMS_CHAT_GROUPS
+    description: "group_policy=allowlist 时允许的群 ID，逗号分隔"
+    prompt: "Allowed group ids"
+    password: false
+  - name: WMS_CHAT_GROUP_ALLOW_FROM
+    description: "群内允许触发的 senderId/昵称，逗号分隔，空=不限，支持 *"
+    prompt: "Allowed group senders"
+    password: false
+  - name: WMS_CHAT_HOME_CHANNEL
+    description: "cron / 通知投递的默认目标（wxid 或 group:<roomid>）"
+    prompt: "Home channel"
+    password: false
