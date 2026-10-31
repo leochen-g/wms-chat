@@ -14,6 +14,8 @@
 
 断线后指数退避自动重连（每次重连重新拉取配置）；重连次数用完会交给 gateway 的重连机制重建。
 
+**支持多个微秘书账号共用同一个 agent**：每个账号一条独立的 MQTT 连接，见下文[多账号](#多账号)。
+
 ## 安装
 
 ```bash
@@ -40,11 +42,11 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # 可选：cron / 通知的默认投递�
 
 ### 环境变量
 
-环境变量优先于 `config.yaml`（`gateway.platforms.wms_chat.extra`，键名为小写下划线，如 `require_mention`）。
+环境变量优先于 `config.yaml`（`gateway.platforms.wms_chat.extra`，键名为小写下划线，如 `require_mention`）。以下除 `API_KEY` / `HOME_CHANNEL` 外都是全局默认，多账号时可在 `accounts[]` 里逐账号覆盖。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `WMS_CHAT_API_KEY` | — | **必填**。微秘书 apiKey |
+| `WMS_CHAT_API_KEY` | — | 微秘书 apiKey，对应 `default` 账号。未使用 `extra.accounts` 时必填 |
 | `WMS_CHAT_API_BASE_URL` | `https://api-bot.aibotk.com` | 后端地址 |
 | `WMS_CHAT_ALLOWED_USERS` | 空 = 不限制 | 限定可触发 agent 的 wxid，逗号分隔，支持 `*`。**只按 wxid 匹配，不看昵称**（昵称可被任意修改） |
 | `WMS_CHAT_GROUP_ALLOWED_CHATS` | — | 设了 `ALLOWED_USERS` 后，这些群（`group:<roomid>`，逗号分隔）内任何人仍可触发 |
@@ -65,7 +67,7 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # 可选：cron / 通知的默认投递�
 
 收紧范围，按需组合（全部在插件的 `inbound.admit` 里执行）：
 
-| 目标 | 配置 |
+| 目标 | 配置（多账号时可写在 `accounts[]` 里逐账号设置） |
 |---|---|
 | 只允许指定的人（好友 + 群成员） | `WMS_CHAT_ALLOWED_USERS=wxid_a,wxid_b` |
 | 只开放指定的群 | `WMS_CHAT_GROUP_POLICY=allowlist` + `WMS_CHAT_GROUPS=roomid1,roomid2` |
@@ -78,6 +80,58 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # 可选：cron / 通知的默认投递�
 默认 `WMS_CHAT_REQUIRE_MENTION=false`，群里所有（通过过滤的）消息都会交给 agent。没被 @ 的消息带 `reply_expected=False`，agent 判断无需回复时可以保持沉默，不会每条都硬回。若希望恢复"必须 @"，设 `WMS_CHAT_REQUIRE_MENTION=true`，并用 `WMS_CHAT_FREE_RESPONSE_GROUPS` 给个别群开例外。
 
 > 注意：媒体消息（图片、视频等）无法携带 @。若开了 `REQUIRE_MENTION=true`，需要平台侧在发布媒体消息时把 `isGroupMention` 置为 `true`，否则会被拦截。
+
+## 多账号
+
+一个 Hermes agent 可以同时接入多个微秘书账号（共用记忆、技能和工具）。每个账号一条独立的 MQTT 连接，各自重连，互不影响；一个账号断线或 apiKey 错误不会拖垮其他账号。
+
+### 配置
+
+单账号：只在 `.env` 里写 `WMS_CHAT_API_KEY`，行为和以前完全一样（账号名为 `default`，chat_id 不带前缀）。
+
+多账号：在 `~/.hermes/config.yaml` 的 `gateway.platforms.wms_chat.extra.accounts` 里列出。**只写 `accounts` 也会自动启用平台**，不需要再设 `WMS_CHAT_API_KEY`；两者可以并存（`WMS_CHAT_API_KEY` 对应 `default` 账号）。
+
+```yaml
+gateway:
+  platforms:
+    wms_chat:
+      extra:
+        # 以下为全局默认，对所有账号生效（也可用对应的环境变量）
+        require_mention: false
+        accounts:
+          - name: shop                # 账号名：字母/数字/_/-，最长 32，不能重复
+            api_key: "key-of-shop"    # 每个账号自己的 apiKey，不能重复
+            allowed_users: wxid_boss  # 以下均为可选，逐账号覆盖全局
+            group_policy: allowlist
+            groups: [roomid1, roomid2]
+          - name: personal
+            api_key: "key-of-personal"
+            allowed_users: []         # 显式写空列表 = 该账号不限制（覆盖全局）
+```
+
+可逐账号覆盖的项：`api_base_url`、`allowed_users`、`group_allowed_chats`、`require_mention`、`group_policy`、`groups`、`free_response_groups`、`group_allow_from`、`max_reconnect_attempts`、`reconnect_base_delay_s`。没写的项继承全局（环境变量 > `extra` 顶层 > 默认值）。配置有误的账号（名字非法、重名、缺 `api_key`、`api_key` 重复）会被跳过，并在启动日志里给出原因。
+
+> `api_key` 写在 `config.yaml` 里，请注意文件权限（`chmod 600`），不要提交到 Git。
+
+### chat_id 与会话隔离
+
+同一个好友可能同时加了两个账号，两个账号也可能在同一个群里。为了让会话互不串线、回复走对的账号，**非 `default` 账号的 chat_id 带 `<账号名>/` 前缀**：
+
+| 账号 | 私聊 chat_id | 群聊 chat_id |
+|---|---|---|
+| `default` | `wxid_abc` | `group:roomid1` |
+| `shop` | `shop/wxid_abc` | `shop/group:roomid1` |
+
+- **入站**：消息进来时按账号生成 chat_id，所以同一个人在两个账号下是两条独立会话。
+- **出站**：agent 回复时 Hermes 把原 chat_id 传回来，插件按前缀把消息发到对应账号的 `sendTopic`。
+- **主动发送 / cron / `send_message`**：目标写成 `shop/wxid_abc`、`shop/group:roomid1|wxid_a,wxid_b`。**多账号且没有 `default` 账号时，不带前缀的目标会被拒绝**（报错并列出账号名），不会随便挑一个账号发。`WMS_CHAT_HOME_CHANNEL` 同理，多账号时请写带前缀的值。
+
+### 注意
+
+- **同一个 apiKey 同一时刻只能被一个 Hermes 进程使用**（MQTT clientId 相同会互相踢下线）。如果某个账号的 key 已被另一个 gateway 占用，该账号会被跳过并在日志里提示，其余账号照常运行。
+- 所有账号共用同一个 agent：它们共享记忆和工具权限。如果不同账号需要隔离（不同人格 / 不同权限），请改用 Hermes 的多 profile，每个账号一个 profile。
+- 按账号区分访问范围时，记得逐账号设置 `allowed_users`：默认每个账号都是"所有好友、所有群"。
+- 一个账号的重连次数用完后只会让该账号离线；全部账号都离线才会触发 gateway 重建 adapter。
 
 ## 消息格式
 
@@ -115,6 +169,7 @@ WMS_CHAT_HOME_CHANNEL=wxid_aaa          # 可选：cron / 通知的默认投递�
 | `wxid_xxx` | 私聊 |
 | `group:roomid_xxx` | 群聊 |
 | `group:roomid_xxx\|wxid_a,wxid_b` | 群聊并 @这些人 |
+| `<账号名>/wxid_xxx` 等 | 同上，指定由哪个账号发送（非 `default` 账号必须带前缀） |
 
 ## 媒体文件
 
@@ -130,9 +185,9 @@ wms-chat/
 ├── after-install.md   安装后提示
 ├── __init__.py        导出 register
 ├── adapter.py         adapter 类 + register()
-├── config.py          设置读取（.env > config.yaml）
+├── config.py          设置读取（.env > config.yaml），多账号解析
 ├── api.py             拉取 MQTT 配置
-├── mqtt_session.py    MQTT 连接 / 重连 / 发布
+├── mqtt_session.py    单个账号的 MQTT 连接 / 重连 / 发布
 ├── inbound.py         解析 + 准入判断
 ├── outbound.py        chat_id → sendTopic payload
 ├── media.py           入站媒体本地化
@@ -140,7 +195,9 @@ wms-chat/
 ├── dashboard_card.py  Dashboard 卡片信息
 ├── send_targets.py    send_message 目标语法
 ├── gateway_env.py     授权环境变量名
-└── tests/test_e2e.py  端到端测试
+└── tests/
+    ├── test_e2e.py            单账号端到端测试
+    └── test_multi_account.py  多账号端到端测试
 ```
 
 ## 开发与测试
@@ -149,13 +206,14 @@ wms-chat/
 hermes plugins validate .          # 准入检查
 pip install paho-mqtt amqtt        # 测试依赖（amqtt 仅测试用）
 HERMES_HOME=/tmp/h PYTHONPATH=<hermes-agent 源码目录> python tests/test_e2e.py
+HERMES_HOME=/tmp/h PYTHONPATH=<hermes-agent 源码目录> python tests/test_multi_account.py
 ```
 
-测试使用真实的 Hermes 基类 + 本地 HTTP 配置服务 + 本地 MQTT broker，覆盖：入站（私聊/群聊/去重/过滤）、出站 payload、媒体落盘、断线重连、cron standalone 发送。
+测试使用真实的 Hermes 基类 + 本地 HTTP 配置服务 + 本地 MQTT broker。`test_e2e.py` 覆盖入站（私聊/群聊/去重/过滤）、出站 payload、媒体落盘、断线重连、cron standalone 发送；`test_multi_account.py` 覆盖账号配置解析、会话隔离、按账号的访问控制和出站路由、单账号重连互不影响、跨进程 apiKey 锁、cron 选账号。
 
 ## 已知限制
 
 - 入站的名片 / h5 链接 / 视频号 / 位置只以 `content` 描述文字传给 agent，`mediaInfo` 未做结构化处理。
 - 因为是 `trusted_inbound`，Hermes 的配对码（pairing）和 `unauthorized_dm_behavior` 对本平台不生效。
-- 同一 apiKey 同一时刻只能由一个 Hermes profile 连接（MQTT clientId 相同会互相踢下线），插件用 scoped lock 保护。
+- 同一 apiKey 同一时刻只能由一个 Hermes 进程连接（MQTT clientId 相同会互相踢下线），插件对每个 apiKey 加 scoped lock 保护。
 - allowlist 群首次被拦截时不会向群里发提醒（OpenClaw 版有）。

@@ -1,18 +1,18 @@
 name: wms-chat
 label: 微秘书 (WMS Chat)
 kind: platform
-version: 0.2.0
+version: 0.3.0
 description: >
   微秘书 (WeChat) gateway adapter for Hermes Agent. Gets MQTT parameters from the
   WMS backend, subscribes to the receive topic, and publishes replies to the send
-  topic. Supports private chats, groups (with or without @mention), and inbound
+  topic. Supports several 微秘书 accounts sharing one agent (extra.accounts), private chats, groups (with or without @mention), and inbound
   image / video / voice / file localization.
 author: wms
 python_dependencies:
   - "paho-mqtt>=1.6,<3"
 requires_env:
   - name: WMS_CHAT_API_KEY
-    description: "微秘书个人中心 apiKey"
+    description: "微秘书个人中心 apiKey（default 账号）。多账号可改在 config.yaml 的 extra.accounts 里配置，此时可不设"
     prompt: "微秘书 apiKey"
     url: "https://wechat.aibotk.com/user/info"
     password: true

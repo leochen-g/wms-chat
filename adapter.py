@@ -2,7 +2,7 @@
 
 Layout (mirrors the Feishu plugin):
   adapter.py       adapter class + register()           <- this file
-  config.py        settings from config.yaml extra + .env
+  config.py        settings from config.yaml extra + .env (multi-account)
   api.py           GET /openapi/v1/openclaw/chat/config -> MQTT params
   mqtt_session.py  paho connect/subscribe/publish + backoff reconnect
   inbound.py       parse + group/DM admission (pure)
@@ -31,8 +31,8 @@ from gateway.platforms.helpers import MessageDeduplicator
 from . import inbound, media, outbound
 from .api import fetch_mqtt_config, strip_scheme
 from .config import (
-    DEFAULT_API_BASE_URL, ENV_API_BASE_URL, ENV_API_KEY, ENV_HOME_CHANNEL, PLATFORM_NAME,
-    is_configured, load_settings,
+    DEFAULT_ACCOUNT, ENV_API_BASE_URL, ENV_API_KEY, ENV_HOME_CHANNEL, PLATFORM_NAME,
+    AccountSettings, is_configured, load_settings,
 )
 from .mqtt_session import MqttSession, new_paho_client, paho_importable
 
@@ -45,11 +45,19 @@ _MESSAGE_TYPES = {
 
 
 class WmsChatAdapter(BasePlatformAdapter):
+    """One adapter, N 微秘书 accounts, one shared agent.
+
+    每个账号一条独立的 MQTT 连接（各自重连、互不影响）。非 default 账号的 chat_id 带
+    ``<account>/`` 前缀：会话按账号隔离，回复按前缀路由回对应账号的 sendTopic。
+    """
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform(PLATFORM_NAME))
         self._s = load_settings(getattr(config, "extra", {}) or {})
-        self._dedup = MessageDeduplicator(max_size=1000, ttl_seconds=300)
-        self._session: Optional[MqttSession] = None
+        self._dedup = MessageDeduplicator(max_size=2000, ttl_seconds=300)
+        self._sessions: dict[str, MqttSession] = {}
+        self._lock_ids: list[str] = []
+        self._dead: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -58,67 +66,102 @@ class WmsChatAdapter(BasePlatformAdapter):
     # ---- lifecycle ------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        if not self._s.api_key:
-            self._set_fatal_error("config_missing", f"{ENV_API_KEY} must be set", retryable=False)
+        for problem in self._s.problems:
+            logger.warning("[wms_chat] config: %s", problem)
+        if not self._s.accounts:
+            self._set_fatal_error(
+                "config_missing", f"{ENV_API_KEY} or extra.accounts must be set", retryable=False)
             return False
-        # 同一 apiKey 同一时刻只允许一个 profile 连接（同 clientId 会互相踢下线）
-        digest = hashlib.sha256(self._s.api_key.encode()).hexdigest()[:16]
-        if not self._acquire_platform_lock(PLATFORM_NAME, digest, "WMS Chat apiKey"):
-            return False
-        self._session = MqttSession(
-            fetch_config=lambda: fetch_mqtt_config(self._s.api_base_url, self._s.api_key),
-            on_message=self._on_raw_message,
-            on_exhausted=self._on_reconnect_exhausted,
-            max_attempts=self._s.max_reconnect_attempts,
-            base_delay=self._s.reconnect_base_delay,
-        )
-        try:
-            await self._session.start()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[wms_chat] connect failed: %s", exc)
-            self._session = None
-            with contextlib.suppress(Exception):
-                self._release_platform_lock()
-            self._set_fatal_error("connect_failed", str(exc), retryable=True)
+        started = 0
+        skipped: list[str] = []
+        for acct in self._s.accounts:
+            # 同一 apiKey 同一时刻只允许一个 profile 连接（同 clientId 会互相踢下线）
+            ident = hashlib.sha256(acct.api_key.encode()).hexdigest()[:16]
+            if not self._acquire_platform_lock(PLATFORM_NAME, ident, f"WMS Chat account {acct.name!r}"):
+                logger.error("[wms_chat:%s] apiKey already in use by another gateway; account skipped", acct.name)
+                skipped.append(acct.name)
+                continue
+            self._lock_ids.append(ident)
+            session = MqttSession(
+                fetch_config=lambda a=acct: fetch_mqtt_config(a.api_base_url, a.api_key),
+                on_message=lambda raw, n=acct.name: self._on_raw_message(n, raw),
+                on_exhausted=lambda n=acct.name: self._on_account_exhausted(n),
+                max_attempts=acct.max_reconnect_attempts,
+                base_delay=acct.reconnect_base_delay,
+                label=f"wms_chat:{acct.name}",
+            )
+            self._sessions[acct.name] = session
+            if await session.start(keep_trying=True):
+                started += 1
+                if not acct.allowed_users:
+                    logger.warning(
+                        "[wms_chat:%s] open access: any WeChat friend and any member of any group can talk "
+                        "to the agent. Set WMS_CHAT_ALLOWED_USERS (wxid list) to restrict.", acct.name)
+        if started == 0:
+            # 一个账号都没连上：交给 gateway 的 reconnect watcher 重建
+            await self._teardown()
+            self._set_fatal_error(
+                "connect_failed", "no 微秘书 account could connect (check apiKey / network)", retryable=True)
             return False
         self._mark_connected()
         self._wire_plugin_handlers(None)
-        if not self._s.allowed_users:
-            logger.warning(
-                "[wms_chat] open access: any WeChat friend and any member of any group can talk to the "
-                "agent. Set WMS_CHAT_ALLOWED_USERS (wxid list) to restrict."
-            )
+        retrying = len(self._sessions) - started
+        if skipped:
+            logger.warning("[wms_chat] skipped (apiKey held by another gateway, restart to retry): %s",
+                           ", ".join(skipped))
+        if retrying:
+            logger.warning("[wms_chat] %d account(s) not connected yet; retrying in the background", retrying)
         return True
 
     async def disconnect(self) -> None:
-        with contextlib.suppress(Exception):
-            self._release_platform_lock()
-        session, self._session = self._session, None
-        if session is not None:
-            await session.stop()
+        await self._teardown()
         self._mark_disconnected()
 
-    async def _on_reconnect_exhausted(self) -> None:
-        # 交给 gateway 的 reconnect watcher 重建 adapter
-        self._set_fatal_error("mqtt_reconnect_exhausted", "MQTT reconnect attempts exhausted", retryable=True)
-        await self._notify_fatal_error()
+    async def _teardown(self) -> None:
+        sessions, self._sessions = self._sessions, {}
+        for session in sessions.values():
+            with contextlib.suppress(Exception):
+                await session.stop()
+        self._dead.clear()
+        self._release_all_locks()
+
+    def _release_all_locks(self) -> None:
+        """基类只记住最后一个锁；这里逐个账号还原 identity 后释放。"""
+        for ident in self._lock_ids:
+            with contextlib.suppress(Exception):
+                self._platform_lock_scope, self._platform_lock_identity = PLATFORM_NAME, ident
+                self._release_platform_lock()
+        self._lock_ids.clear()
+
+    async def _on_account_exhausted(self, account: str) -> None:
+        """单个账号重连用尽：只标记该账号失效；全部失效才交给 gateway 重建 adapter。"""
+        self._dead.add(account)
+        logger.error("[wms_chat:%s] reconnect attempts exhausted; account is offline until gateway restart", account)
+        if self._sessions and self._dead >= set(self._sessions):
+            self._set_fatal_error(
+                "mqtt_reconnect_exhausted", "MQTT reconnect attempts exhausted for all accounts", retryable=True)
+            await self._notify_fatal_error()
 
     # ---- inbound --------------------------------------------------------
 
-    async def _on_raw_message(self, raw: bytes) -> None:
+    async def _on_raw_message(self, account: str, raw: bytes) -> None:
         m = inbound.parse_inbound(raw)
         if m is None:
-            logger.warning("[wms_chat] unparseable inbound message")
+            logger.warning("[wms_chat:%s] unparseable inbound message", account)
             return
-        await self._handle_inbound(m)
+        await self._handle_inbound(account, m)
 
-    async def _handle_inbound(self, m: dict[str, Any]) -> None:
+    async def _handle_inbound(self, account: str, m: dict[str, Any]) -> None:
         try:
-            reason = inbound.admit(self._s, m)
-            if reason:
-                logger.debug("[wms_chat] drop %s: %s", m.get("messageId"), reason)
+            acct = self._s.account(account)
+            if acct is None:
                 return
-            if self._dedup.is_duplicate(m["messageId"]):
+            reason = inbound.admit(acct, m)
+            if reason:
+                logger.debug("[wms_chat:%s] drop %s: %s", account, m.get("messageId"), reason)
+                return
+            # 去重键带账号：两个账号可能同时收到同一条群消息，各自都要处理
+            if self._dedup.is_duplicate(f"{account}:{m['messageId']}"):
                 return
             text = m["content"]
             url = m.get("url") if isinstance(m.get("url"), str) else None
@@ -145,7 +188,7 @@ class WmsChatAdapter(BasePlatformAdapter):
                 else:
                     return
 
-            chat_id, chat_name, chat_type = inbound.chat_identity(m)
+            chat_id, chat_name, chat_type = inbound.chat_identity(m, account)
             source = self.build_source(
                 chat_id=chat_id, chat_name=chat_name, chat_type=chat_type,
                 user_id=m["senderId"], user_name=m.get("senderName") or m["senderId"],
@@ -158,23 +201,38 @@ class WmsChatAdapter(BasePlatformAdapter):
                 message_id=m["messageId"], raw_message=m,
                 media_urls=media_urls, media_types=media_types, media_filenames=media_names,
                 reply_expected=inbound.reply_expected(m),
+                metadata={"wms_account": account},
                 timestamp=(datetime.datetime.fromtimestamp(ts / 1000)
                            if isinstance(ts, (int, float)) else datetime.datetime.now()),
             )
             await self.handle_message(event)
         except Exception:  # noqa: BLE001
-            logger.exception("[wms_chat] inbound handling failed")
+            logger.exception("[wms_chat:%s] inbound handling failed", account)
 
     # ---- outbound -------------------------------------------------------
 
+    def _route(self, chat_id: str) -> tuple[Optional[str], str]:
+        """chat_id -> (账号名, 去前缀后的目标)。无前缀：default 账号；没有 default 则仅当只有一个账号时用它。"""
+        account, raw = outbound.split_account(chat_id, self._sessions.keys())
+        if account is None:
+            if DEFAULT_ACCOUNT in self._sessions:
+                account = DEFAULT_ACCOUNT
+            elif len(self._sessions) == 1:
+                account = next(iter(self._sessions))
+        return account, raw
+
     async def _publish(self, chat_id: str, messages: list[dict[str, Any]]) -> SendResult:
-        session = self._session
-        if session is None:
-            return SendResult(success=False, error="Not connected", retryable=True)
+        account, raw = self._route(chat_id)
+        if account is None:
+            names = ", ".join(sorted(self._sessions)) or "none"
+            return SendResult(
+                success=False, retryable=False,
+                error=f"cannot pick a 微秘书 account for {chat_id!r}; prefix it with <account>/ (accounts: {names})")
         try:
-            await session.publish(json.dumps(outbound.build_payload(chat_id, messages), ensure_ascii=False))
+            await self._sessions[account].publish(
+                json.dumps(outbound.build_payload(raw, messages), ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001
-            return SendResult(success=False, error=str(exc), retryable=True)
+            return SendResult(success=False, error=f"[{account}] {exc}", retryable=True)
         return SendResult(success=True, message_id=f"wms-{uuid.uuid4().hex[:12]}")
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -193,7 +251,11 @@ class WmsChatAdapter(BasePlatformAdapter):
         """微秘书没有输入中状态。"""
 
     async def get_chat_info(self, chat_id: str) -> dict:
-        return {"name": chat_id, "type": "group" if chat_id.startswith("group:") else "dm"}
+        account, raw = self._route(chat_id)
+        info = {"name": chat_id, "type": "group" if raw.startswith("group:") else "dm"}
+        if account:
+            info["account"] = account
+        return info
 
 
 # --------------------------------------------------------------------------
@@ -233,29 +295,37 @@ def _env_enablement() -> Optional[dict]:
 
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None,
                            force_document=False):
-    """gateway 之外（hermes cron run）发送：临时建连、发布、断开。"""
+    """gateway 之外（hermes cron run）发送：按 chat_id 前缀选账号，临时建连、发布、断开。"""
     if not ensure_deps():
         return send_error("wms_chat standalone send: paho-mqtt not installed")
     s = load_settings(getattr(pconfig, "extra", {}) or {})
-    if not s.api_key:
-        return send_error(f"wms_chat standalone send: {ENV_API_KEY} not set")
+    if not s.accounts:
+        return send_error(f"wms_chat standalone send: {ENV_API_KEY} or extra.accounts not set")
     if not chat_id:
         return send_error("wms_chat standalone send: chat_id (wxid or group:<roomid>) required")
+    names = [a.name for a in s.accounts]
+    account, raw = outbound.split_account(chat_id, names)
+    if account is None:
+        account = DEFAULT_ACCOUNT if DEFAULT_ACCOUNT in names else (names[0] if len(names) == 1 else None)
+    if account is None:
+        return send_error(
+            f"wms_chat standalone send: prefix chat_id with <account>/ (accounts: {', '.join(sorted(names))})")
+    acct: AccountSettings = s.account(account)
 
     def _run() -> dict:
-        cfg = fetch_mqtt_config(s.api_base_url, s.api_key)
+        cfg = fetch_mqtt_config(acct.api_base_url, acct.api_key)
         # 复用 clientId 会把在线 gateway 挤下线，加后缀避免冲突
         client = new_paho_client(f"{cfg['clientId']}-cron-{uuid.uuid4().hex[:6]}")
         client.username_pw_set(cfg["username"], cfg["password"])
         client.connect(strip_scheme(cfg["host"]), int(cfg["port"]), keepalive=30)
         client.loop_start()
         try:
-            payload = outbound.build_payload(chat_id, [outbound.text_message(message)])
+            payload = outbound.build_payload(raw, [outbound.text_message(message)])
             info = client.publish(cfg["sendTopic"], json.dumps(payload, ensure_ascii=False), qos=1)
             info.wait_for_publish(timeout=10)
             if not info.is_published():
                 return send_error("publish not acknowledged")
-            return {"success": True, "platform": PLATFORM_NAME, "chat_id": chat_id,
+            return {"success": True, "platform": PLATFORM_NAME, "chat_id": chat_id, "account": account,
                     "message_id": f"wms-{uuid.uuid4().hex[:12]}"}
         finally:
             client.loop_stop()

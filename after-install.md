@@ -24,5 +24,19 @@ WMS_CHAT_API_KEY=你的apiKey
 hermes gateway run
 ```
 
+**多个微秘书账号共用一个 agent**：在 `~/.hermes/config.yaml` 里配置（只写这个也会自动启用）：
+
+```yaml
+gateway:
+  platforms:
+    wms_chat:
+      extra:
+        accounts:
+          - {name: shop, api_key: "key-of-shop"}
+          - {name: personal, api_key: "key-of-personal"}
+```
+
+非 `default` 账号的 chat_id 带 `<账号名>/` 前缀（如 `shop/wxid_abc`），主动发送时也要带。详见 README 的「多账号」。
+
 首次连接会自动安装 `paho-mqtt`。群消息默认**不需要 @机器人**；想改成必须 @，设置 `WMS_CHAT_REQUIRE_MENTION=true`。
 完整配置见 [README](https://github.com/leochen-g/wms-chat#readme)。

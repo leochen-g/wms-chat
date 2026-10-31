@@ -4,7 +4,25 @@ chat_id 约定：私聊 = wxid；群聊 = ``group:<roomid>``，可加 ``|wxid_a,
 消息体 type：1=文字，2=图片 URL。
 """
 
-from typing import Any
+from typing import Any, Collection, Optional
+
+DEFAULT_ACCOUNT = "default"
+
+
+def prefix_chat_id(account: str, chat_id: str) -> str:
+    """default 账号不加前缀（单账号用户无感）；其余为 ``<account>/<chat_id>``。"""
+    return chat_id if account == DEFAULT_ACCOUNT else f"{account}/{chat_id}"
+
+
+def split_account(chat_id: str, known: Collection[str]) -> tuple[Optional[str], str]:
+    """``shop/wxid_a`` -> (``shop``, ``wxid_a``)；无（已知）前缀 -> (None, chat_id)。"""
+    target = chat_id.strip()
+    if target.lower().startswith("wms_chat:"):
+        target = target[len("wms_chat:"):].strip()
+    head, sep, rest = target.partition("/")
+    if sep and head in known:
+        return head, rest
+    return None, target
 
 
 def parse_target(chat_id: str) -> dict[str, Any]:

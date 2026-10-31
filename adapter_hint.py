@@ -9,5 +9,8 @@ PLATFORM_HINT = (
     "when the message is addressed to you or you can clearly help, otherwise stay silent. "
     "To send an image include its public URL via the image tool. "
     "Send targets: a wxid for a private chat, group:<roomid> for a group, and "
-    "group:<roomid>|wxid_a,wxid_b to @ those people."
+    "group:<roomid>|wxid_a,wxid_b to @ those people. Several 微秘书 accounts may share this agent: "
+    "chats of the default account use the plain ids above, chats of any other account are prefixed "
+    "with <account>/ (e.g. shop/wxid_a, shop/group:<roomid>). Always reply into the same chat id you "
+    "received the message from; the prefix selects which WeChat account sends it."
 )

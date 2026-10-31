@@ -48,7 +48,9 @@ class MqttSession:
         on_exhausted: Callable[[], Awaitable[None]],
         max_attempts: int,
         base_delay: float,
+        label: str = "wms_chat",
     ):
+        self._label = label
         self._fetch_config = fetch_config
         self._on_message = on_message
         self._on_exhausted = on_exhausted
@@ -71,12 +73,27 @@ class MqttSession:
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected()
 
-    async def start(self) -> None:
-        """首次建连；失败抛异常（由 adapter 转成 fatal error）。"""
+    async def start(self, *, keep_trying: bool = False) -> bool:
+        """首次建连。返回是否已连上。
+
+        keep_trying=False：失败直接抛异常。
+        keep_trying=True：失败不抛，转入后台指数退避重试（多账号时，一个账号起不来不能拖垮其他账号）。
+        """
         self._loop = asyncio.get_running_loop()
         self._stopping = False
-        await self._open()
+        ok = True
+        try:
+            await self._open()
+        except Exception as exc:  # noqa: BLE001
+            if not keep_trying:
+                raise
+            logger.warning("[%s] initial connect failed, will keep retrying: %s", self._label, exc)
+            self._close()
+            ok = False
         self._supervisor = asyncio.create_task(self._supervise())
+        if not ok:
+            self._lost.set()
+        return ok
 
     async def stop(self) -> None:
         self._stopping = True
@@ -139,7 +156,7 @@ class MqttSession:
             while not self._stopping:
                 attempts += 1
                 if attempts > self._max_attempts:
-                    logger.error("[wms_chat] max reconnect attempts reached")
+                    logger.error("[%s] max reconnect attempts reached", self._label)
                     await self._on_exhausted()
                     return
                 delay = min(self._base_delay * 2 ** attempts, MAX_BACKOFF_S)
@@ -147,10 +164,10 @@ class MqttSession:
                 try:
                     await self._open()
                     attempts = 0
-                    logger.info("[wms_chat] reconnected")
+                    logger.info("[%s] reconnected", self._label)
                     break
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("[wms_chat] reconnect %d failed: %s", attempts, exc)
+                    logger.warning("[%s] reconnect %d failed: %s", self._label, attempts, exc)
 
     # ---- paho thread callbacks -------------------------------------------
 
@@ -161,7 +178,7 @@ class MqttSession:
             client.subscribe(self._cfg["reciveTopic"], qos=1)
             self._ready.set()
         else:
-            logger.error("[wms_chat] MQTT connect refused rc=%s", rc)
+            logger.error("[%s] MQTT connect refused rc=%s", self._label, rc)
             self._cb_lost(gen)
 
     def _cb_lost(self, gen: int) -> None:

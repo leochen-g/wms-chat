@@ -52,7 +52,8 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 def S(**kw):
-    return cfgmod.load_settings({"api_key": "k", **kw})
+    """default 账号的有效设置（单账号旧行为必须保持不变）。"""
+    return cfgmod.load_settings({"api_key": "k", **kw}).accounts[0]
 
 def msg(**kw):
     m = dict(content="hi", robotId="wxid_bot", senderId="wxid_u", senderName="Al", messageId="m", isGroup=False,
@@ -77,6 +78,7 @@ def unit_tests():
     assert inbound.admit(S(group_allow_from="bob"), msg(**g)) == "sender_not_allowed"
     assert inbound.admit(S(group_allow_from="AL"), msg(**g)) is None
     assert inbound.admit(S(group_allow_from="*"), msg(**g)) is None
+    assert cfgmod.load_settings({"api_key": "k"}).accounts[0].name == "default"
     assert inbound.admit(S(), msg(isMyself=True)) == "self_echo"
     assert inbound.admit(S(), msg(senderId="wxid_bot")) == "self_echo"
     # 默认范围：所有好友、所有群
@@ -98,7 +100,7 @@ def unit_tests():
     # .env 读取（env 优先于 YAML）
     os.environ["WMS_CHAT_REQUIRE_MENTION"] = "true"; os.environ["WMS_CHAT_GROUPS"] = "a, b"
     os.environ["WMS_CHAT_GROUP_POLICY"] = "allowlist"
-    s = cfgmod.load_settings({"api_key": "k", "require_mention": False})
+    s = cfgmod.load_settings({"api_key": "k", "require_mention": False}).accounts[0]
     assert s.require_mention is True and s.groups == {"a", "b"} and s.group_policy == "allowlist"
     for k in ("WMS_CHAT_REQUIRE_MENTION", "WMS_CHAT_GROUPS", "WMS_CHAT_GROUP_POLICY"): os.environ.pop(k)
     # env_enablement：只有 API key 就启用，并带 home channel
@@ -185,13 +187,14 @@ async def main():
                           "messages": [{"type": 1, "content": "cap"}, {"type": 2, "url": "https://x/y.jpg"}]}
 
     # 断线 -> 自动重连
-    a._session._base_delay = 0.05
-    a._session._client.disconnect()
+    sess = a._sessions["default"]
+    sess._base_delay = 0.05
+    sess._client.disconnect()
     await asyncio.sleep(0.3)
     for _ in range(80):
-        if a._session.is_connected: break
+        if sess.is_connected: break
         await asyncio.sleep(0.1)
-    assert a._session.is_connected, "did not reconnect"
+    assert sess.is_connected, "did not reconnect"
     n = len(events); send_in(content="after", messageId="m9")
     for _ in range(50):
         if len(events) > n: break

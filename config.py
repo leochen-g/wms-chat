@@ -1,5 +1,10 @@
 """WMS Chat settings: ``config.yaml`` ``extra`` + ``~/.hermes/.env`` (env wins over YAML).
 
+多账号：一个 adapter 同时连多个微秘书账号，共用同一个 agent。
+  * ``WMS_CHAT_API_KEY``（.env）或 ``extra.api_key`` 定义名为 ``default`` 的账号，chat_id 不加前缀；
+  * ``extra.accounts`` 列表定义更多账号，每项 ``name`` + ``api_key``，其余访问控制项可逐账号覆盖，
+    未覆盖的继承全局值（环境变量 > extra 顶层 > 默认）。非 default 账号的 chat_id 形如 ``<name>/<chat_id>``。
+
 Env vars (all optional except the API key):
   WMS_CHAT_API_KEY              微秘书 apiKey（必填）
   WMS_CHAT_API_BASE_URL         后端地址，默认 https://api-bot.aibotk.com
@@ -14,6 +19,7 @@ Env vars (all optional except the API key):
 本插件以 trusted_inbound 注册：Hermes 网关不再按白名单/配对码拦人，准入全部由本插件决定。
 """
 
+import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -27,6 +33,8 @@ ENV_API_BASE_URL = "WMS_CHAT_API_BASE_URL"
 ENV_HOME_CHANNEL = "WMS_CHAT_HOME_CHANNEL"
 
 GROUP_POLICIES = ("open", "allowlist", "disabled")
+DEFAULT_ACCOUNT = "default"
+_ACCOUNT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
 def to_bool(value: Any, default: bool = False) -> bool:
@@ -58,10 +66,11 @@ def _to_float(value: Any, default: float) -> float:
 
 
 @dataclass(frozen=True)
-class WmsChatSettings:
-    """Snapshot taken in the adapter constructor (MQTT callbacks run on a thread with no
-    profile secret scope, so nothing may read env lazily)."""
+class AccountSettings:
+    """One 微秘书 account (one MQTT connection). Snapshot taken in the adapter constructor: MQTT
+    callbacks run on a thread with no profile secret scope, so nothing may read env lazily."""
 
+    name: str
     api_key: str
     api_base_url: str
     allowed_users: frozenset[str]
@@ -75,19 +84,36 @@ class WmsChatSettings:
     reconnect_base_delay: float
 
 
-def load_settings(extra: Optional[dict]) -> WmsChatSettings:
-    extra = extra or {}
+@dataclass(frozen=True)
+class WmsChatSettings:
+    accounts: tuple[AccountSettings, ...]
+    problems: tuple[str, ...] = ()  # 配置问题（被跳过的账号等），由 adapter 在连接时一并告警
 
-    def get(key: str, env: str, default: Any = "") -> Any:
+    def account(self, name: str) -> Optional[AccountSettings]:
+        return next((a for a in self.accounts if a.name == name), None)
+
+
+def _present(value: Any) -> bool:
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+def _build_account(name: str, api_key: str, extra: dict, acct: dict) -> AccountSettings:
+    """``acct`` 中出现的键覆盖全局；全局 = 环境变量 > extra 顶层 > 默认。"""
+
+    def get(key: str, env: str, default: Any = "", *, own_key: Optional[str] = None) -> Any:
+        k = own_key or key
+        if k in acct and _present(acct[k]):
+            return acct[k]  # 含空列表：显式的“不限制”
         return extra_or_secret(extra, key, env, default)
 
     policy = str(get("group_policy", "WMS_CHAT_GROUP_POLICY", "open")).strip().lower()
     if policy not in GROUP_POLICIES:
         policy = "open"
-    return WmsChatSettings(
-        api_key=str(get("api_key", ENV_API_KEY)).strip(),
-        api_base_url=str(get("api_base_url", ENV_API_BASE_URL, DEFAULT_API_BASE_URL)).strip().rstrip("/")
-        or DEFAULT_API_BASE_URL,
+    base = str(get("api_base_url", ENV_API_BASE_URL, DEFAULT_API_BASE_URL)).strip().rstrip("/")
+    return AccountSettings(
+        name=name,
+        api_key=api_key,
+        api_base_url=base or DEFAULT_API_BASE_URL,
         # 默认空 = 不限制：所有好友、所有群都可触发
         allowed_users=frozenset(s.lower() for s in to_list(get("allowed_users", "WMS_CHAT_ALLOWED_USERS"))),
         group_allowed_chats=frozenset(
@@ -113,6 +139,42 @@ def load_settings(extra: Optional[dict]) -> WmsChatSettings:
     )
 
 
+def load_settings(extra: Optional[dict]) -> WmsChatSettings:
+    extra = extra or {}
+    accounts: list[AccountSettings] = []
+    problems: list[str] = []
+    seen_keys: dict[str, str] = {}
+
+    def add(name: str, api_key: str, acct: dict) -> None:
+        if not _ACCOUNT_NAME_RE.match(name):
+            problems.append(f"account name {name!r} invalid (use letters, digits, _ or -, max 32); skipped")
+            return
+        if any(a.name == name for a in accounts):
+            problems.append(f"duplicate account name {name!r}; skipped")
+            return
+        if api_key in seen_keys:
+            problems.append(f"account {name!r} reuses the api_key of {seen_keys[api_key]!r}; skipped")
+            return
+        seen_keys[api_key] = name
+        accounts.append(_build_account(name, api_key, extra, acct))
+
+    top_key = str(extra_or_secret(extra, "api_key", ENV_API_KEY)).strip()
+    if top_key:
+        add(DEFAULT_ACCOUNT, top_key, {})
+    raw = extra.get("accounts")
+    for i, item in enumerate(raw if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            problems.append(f"accounts[{i}] is not a mapping; skipped")
+            continue
+        key = str(item.get("api_key") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not key or not name:
+            problems.append(f"accounts[{i}] needs both name and api_key; skipped")
+            continue
+        add(name, key, item)
+    return WmsChatSettings(accounts=tuple(accounts), problems=tuple(problems))
+
+
 def is_configured(config: Any) -> bool:
-    """Used for ``validate_config`` / ``is_connected``: an API key is enough."""
-    return bool(load_settings(getattr(config, "extra", None)).api_key)
+    """Used for ``validate_config`` / ``is_connected``: at least one account with an API key."""
+    return bool(load_settings(getattr(config, "extra", None)).accounts)

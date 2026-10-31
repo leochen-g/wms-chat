@@ -9,7 +9,8 @@ allowed_users 只按 senderId(wxid) 匹配：昵称可被任意修改，不能�
 import json
 from typing import Any, Optional
 
-from .config import WmsChatSettings
+from .config import AccountSettings
+from .outbound import prefix_chat_id
 
 REQUIRED_STR_FIELDS = ("content", "robotId", "senderId", "messageId")
 
@@ -35,12 +36,12 @@ def match_list(entries, *candidates: str) -> bool:
     return any(c and c.lower() in entries for c in candidates)
 
 
-def sender_allowed(s: WmsChatSettings, m: dict[str, Any]) -> bool:
+def sender_allowed(s: AccountSettings, m: dict[str, Any]) -> bool:
     """allowed_users 为空 = 不限制；否则只按 senderId 精确匹配（大小写不敏感，``*`` 通配）。"""
     return not s.allowed_users or match_list(s.allowed_users, m["senderId"])
 
 
-def admit(s: WmsChatSettings, m: dict[str, Any]) -> Optional[str]:
+def admit(s: AccountSettings, m: dict[str, Any]) -> Optional[str]:
     """None=放行；否则返回拒绝原因（用于 debug 日志）。DM 授权交给 Hermes 网关。"""
     if m.get("isMyself") is True or m["senderId"] == m["robotId"]:
         return "self_echo"
@@ -69,9 +70,12 @@ def reply_expected(m: dict[str, Any]) -> Optional[bool]:
     return True if is_mentioned(m) else False
 
 
-def chat_identity(m: dict[str, Any]) -> tuple[str, str, str]:
-    """(chat_id, chat_name, chat_type)。群聊 chat_id=group:<roomid>，私聊=senderId。"""
+def chat_identity(m: dict[str, Any], account: str) -> tuple[str, str, str]:
+    """(chat_id, chat_name, chat_type)。群聊 group:<roomid>，私聊 senderId；非 default 账号加 ``<account>/`` 前缀。
+
+    前缀保证同一个好友 / 同一个群被两个账号同时看到时，会话互相独立、回复走各自的账号。"""
     if m.get("isGroup"):
-        chat_id = f"group:{m.get('groupId') or m['senderId']}"
-        return chat_id, m.get("groupName") or chat_id, "group"
-    return m["senderId"], m.get("conversionName") or m.get("senderName") or m["senderId"], "dm"
+        raw = f"group:{m.get('groupId') or m['senderId']}"
+        return prefix_chat_id(account, raw), m.get("groupName") or raw, "group"
+    name = m.get("conversionName") or m.get("senderName") or m["senderId"]
+    return prefix_chat_id(account, m["senderId"]), name, "dm"

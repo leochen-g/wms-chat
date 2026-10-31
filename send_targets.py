@@ -2,8 +2,8 @@
 
 import re
 
-# wxid_xxx | group:<roomid> | group:<roomid>|wxid_a,wxid_b
-_TARGET_RE = re.compile(r"^\s*((?:group:[^\s|]+(?:\|[^\s|]+)?)|(?:wxid_[-A-Za-z0-9_]+))\s*$")
+# [<account>/]wxid_xxx | [<account>/]group:<roomid> | ...group:<roomid>|wxid_a,wxid_b
+_TARGET_RE = re.compile(r"^\s*((?:[A-Za-z0-9_-]{1,32}/)?(?:(?:group:[^\s|/]+(?:\|[^\s|/]+)?)|(?:wxid_[-A-Za-z0-9_]+)))\s*$")
 
 
 def parse_target_ref(ref: str):
