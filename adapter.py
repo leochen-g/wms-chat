@@ -17,18 +17,19 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import uuid
 from typing import Any, Optional
 
 from gateway.config import Platform
-from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
-from gateway.platforms._shared import seed_extra_from_env as _seed_extra_from_env
-from gateway.platforms._shared import send_error
 from gateway.platforms.base import BasePlatformAdapter, SendResult
-from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.helpers import MessageDeduplicator
 
-from . import inbound, media, outbound
+from . import compat, gateway_env, inbound, media, outbound
+from .compat import MessageType
+from .compat import get_scoped_secret as _get_scoped_secret
+from .compat import seed_extra_from_env as _seed_extra_from_env
+from .compat import send_error
 from .api import fetch_mqtt_config, strip_scheme
 from .config import (
     DEFAULT_ACCOUNT, ENV_API_BASE_URL, ENV_API_KEY, ENV_HOME_CHANNEL, PLATFORM_NAME,
@@ -103,8 +104,9 @@ class WmsChatAdapter(BasePlatformAdapter):
             self._set_fatal_error(
                 "connect_failed", "no 微秘书 account could connect (check apiKey / network)", retryable=True)
             return False
+        self._delegate_authorization()
         self._mark_connected()
-        self._wire_plugin_handlers(None)
+        compat.wire_plugin_handlers(self)
         retrying = len(self._sessions) - started
         if skipped:
             logger.warning("[wms_chat] skipped (apiKey held by another gateway, restart to retry): %s",
@@ -112,6 +114,17 @@ class WmsChatAdapter(BasePlatformAdapter):
         if retrying:
             logger.warning("[wms_chat] %d account(s) not connected yet; retrying in the background", retrying)
         return True
+
+    def _delegate_authorization(self) -> None:
+        """准入由 inbound.admit 负责。旧版 Hermes 没有 ``trusted_inbound``，网关会按自己的白名单再拦一次，
+        陌生人只会收到配对码；这里把网关层设为“放行”（用户显式设置的值优先），真正的限制仍由本插件执行。"""
+        if compat.supports_trusted_inbound():
+            return
+        var = gateway_env.AUTHZ["allow_all_env"]
+        if var not in os.environ:
+            os.environ[var] = "true"
+            logger.info("[wms_chat] this Hermes has no trusted_inbound; set %s=true so the gateway defers "
+                        "to the plugin's own access rules (WMS_CHAT_ALLOWED_USERS etc.)", var)
 
     async def disconnect(self) -> None:
         await self._teardown()
@@ -189,13 +202,14 @@ class WmsChatAdapter(BasePlatformAdapter):
                     return
 
             chat_id, chat_name, chat_type = inbound.chat_identity(m, account)
-            source = self.build_source(
+            source = compat.build_source(
+                self,
                 chat_id=chat_id, chat_name=chat_name, chat_type=chat_type,
                 user_id=m["senderId"], user_name=m.get("senderName") or m["senderId"],
                 message_id=m["messageId"],
             )
             ts = m.get("timestamp")
-            event = MessageEvent(
+            event = compat.make_event(
                 text=text, message_type=msg_type, source=source,
                 user_id=m["senderId"], user_name=m.get("senderName") or m["senderId"],
                 message_id=m["messageId"], raw_message=m,
@@ -344,10 +358,19 @@ def register(ctx) -> None:
     from .dashboard_card import DASHBOARD_CARD
     from .send_targets import SEND_ENTRY_KWARGS
 
-    ctx.register_platform(
+    check_fn = check_requirements
+    if "ensure_deps_fn" not in compat.platform_entry_fields():
+        # 旧版 Hermes 没有 ensure_deps_fn：check_fn 只能兼任安装器，否则缺依赖时平台永远不启用
+        def check_fn() -> bool:  # noqa: F811
+            return paho_importable() or ensure_deps()
+
+    # 只传当前 Hermes 认识的 PlatformEntry 字段；不认识的（如旧版没有 trusted_inbound）会被忽略，
+    # 而不是让整个注册失败。
+    compat.register_platform(
+        ctx,
         **SEND_ENTRY_KWARGS, **DASHBOARD_CARD,
         name=PLATFORM_NAME, label="微秘书 (WMS Chat)", adapter_factory=WmsChatAdapter,
-        check_fn=check_requirements, ensure_deps_fn=ensure_deps,
+        check_fn=check_fn, ensure_deps_fn=ensure_deps,
         validate_config=is_configured, is_connected=is_configured,
         required_env=[ENV_API_KEY], install_hint="pip install paho-mqtt",
         env_enablement_fn=_env_enablement, cron_deliver_env_var=ENV_HOME_CHANNEL,

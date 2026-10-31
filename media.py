@@ -10,11 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import unquote, urlparse, urlunparse
 
-from gateway.platforms.base import (
-    cache_media_bytes_async,
-    get_inbound_media_max_bytes,
-    validate_inbound_media_size,
-)
+from . import compat
 
 logger = logging.getLogger(__name__)
 
@@ -58,29 +54,27 @@ def guess_filename(content: str, url: str) -> str:
 
 async def localize(url: str, msg_type: str, content: str = "") -> Optional[LocalizedMedia]:
     """下载并缓存；任何失败返回 None（不阻塞文字派发）。"""
-    from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
-
     default_kind, _ = KIND_BY_TYPE.get(msg_type, (None, "DOCUMENT"))
-    if not is_safe_url(url):
+    if not compat.url_is_safe(url):
         logger.warning("[wms_chat] blocked unsafe media URL %s", safe_url_for_log(url))
         return None
     try:
-        max_bytes = get_inbound_media_max_bytes()
+        max_bytes = compat.inbound_media_max_bytes()
         chunks: list[bytes] = []
         total = 0
-        async with create_ssrf_safe_async_client(timeout=30.0, follow_redirects=True) as client:
+        async with compat.ssrf_safe_client(timeout=30.0, follow_redirects=True) as client:
             async with client.stream("GET", url, headers={"User-Agent": "HermesAgent/1.0"}) as resp:
                 resp.raise_for_status()
                 mime = resp.headers.get("content-type", "").split(";")[0].strip()
                 declared = resp.headers.get("content-length")
                 if declared and declared.isdigit():
-                    validate_inbound_media_size(int(declared), media_type=msg_type, max_bytes=max_bytes)
+                    compat.validate_media_size(int(declared), media_type=msg_type, max_bytes=max_bytes)
                 async for chunk in resp.aiter_bytes():
                     total += len(chunk)
-                    validate_inbound_media_size(total, media_type=msg_type, max_bytes=max_bytes)
+                    compat.validate_media_size(total, media_type=msg_type, max_bytes=max_bytes)
                     chunks.append(chunk)
         filename = guess_filename(content, url)
-        cached = await cache_media_bytes_async(
+        cached = await compat.cache_media_bytes(
             b"".join(chunks), filename=filename, mime_type=mime, default_kind=default_kind
         )
         if cached is None:

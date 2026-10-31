@@ -9,5 +9,7 @@
 
 AUTHZ = {
     "allowed_users_env": "WMS_CHAT_ALLOWED_USERS",
+    # 仅旧版 Hermes（无 trusted_inbound）用：adapter 连接时默认设为 true，让网关把准入交给插件
+    "allow_all_env": "WMS_CHAT_ALLOW_ALL_USERS",
     "group_allowed_chats_env": "WMS_CHAT_GROUP_ALLOWED_CHATS",
 }

@@ -23,7 +23,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from gateway.platforms._shared import extra_or_secret
+from .compat import extra_or_secret
 
 PLATFORM_NAME = "wms_chat"
 DEFAULT_API_BASE_URL = "https://api-bot.aibotk.com"

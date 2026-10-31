@@ -17,6 +17,11 @@ def fetch_mqtt_config(api_base_url: str, api_key: str, timeout: float = 10.0) ->
         data = json.loads(resp.read().decode("utf-8"))
     if not isinstance(data, dict):
         raise ValueError("config response is not an object")
+    # 后端的业务错误也是 HTTP 200：{"code":403,"msg":"请检查apiKey是否填写错误"} / {"error":"..."}
+    if "host" not in data and (data.get("msg") or data.get("error") or data.get("message")):
+        detail = data.get("msg") or data.get("error") or data.get("message")
+        code = f" (code {data['code']})" if "code" in data else ""
+        raise ValueError(f"WMS backend rejected the request{code}: {str(detail)[:200]}")
     for key in REQUIRED_FIELDS:
         if not data.get(key):
             raise ValueError(f'missing field "{key}" in config response')
