@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import secrets
 import threading
 from typing import Any, Awaitable, Callable, Optional
 
@@ -33,6 +34,20 @@ def new_paho_client(client_id: str):
     if hasattr(mqtt, "CallbackAPIVersion"):
         return mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id=client_id, clean_session=True)
     return mqtt.Client(client_id=client_id, clean_session=True)
+
+
+def make_client_id(base: str) -> str:
+    """后端给的 clientId + 随机后缀（只含 [A-Za-z0-9-]）。
+
+    broker 对同一 clientId 只保留一条连接：另一个进程、上次没断干净的会话、或同账号的其他客户端
+    都会和固定 clientId 互相冲突。每次建连（含重连）换一个新的，就不会再互相踢。
+    """
+    return f"{base}-{secrets.token_hex(3)}"
+
+
+def supports_socket_callback() -> bool:
+    import paho.mqtt.client as mqtt
+    return hasattr(mqtt.Client, "on_socket_open")
 
 
 def rc_ok(rc: Any) -> bool:
@@ -63,6 +78,7 @@ class MqttSession:
         self._stopping = False
         self._lost = asyncio.Event()
         self._ready = threading.Event()
+        self._tcp_open = threading.Event()  # TCP 已连上（还没收到 CONNACK 时用来区分故障位置）
         self._supervisor: Optional[asyncio.Task] = None
 
     @property
@@ -126,18 +142,33 @@ class MqttSession:
         self._cfg = cfg
         self._lost.clear()
         self._ready.clear()
+        self._tcp_open.clear()
 
-        client = new_paho_client(cfg["clientId"])
+        host, port = strip_scheme(cfg["host"]), int(cfg["port"])
+        client_id = make_client_id(str(cfg["clientId"]))
+        client = new_paho_client(client_id)
         client.username_pw_set(cfg["username"], cfg["password"])
         client.on_connect = lambda c, u, f, rc, *a: self._cb_connect(gen, c, rc)
         client.on_message = lambda c, u, m: self._cb_message(gen, m)
-        client.on_disconnect = lambda c, u, *a: self._cb_lost(gen)
+        client.on_disconnect = lambda c, u, *a: self._cb_lost(gen, a[0] if a else None)
+        client.on_socket_open = lambda c, u, s: self._cb_socket(gen)
+        client.on_subscribe = lambda c, u, mid, *a: self._cb_subscribed(gen, a[0] if a else None)
+        client.on_connect_fail = lambda c, u: logger.warning("[%s] TCP connect to %s:%s failed", self._label, host, port)
         self._client = client
-        client.connect_async(strip_scheme(cfg["host"]), int(cfg["port"]), keepalive=60)
+        logger.info("[%s] connecting to %s:%s as clientId=%s (broker clientId=%s)",
+                    self._label, host, port, client_id, cfg["clientId"])
+        client.connect_async(host, port, keepalive=60)
         client.loop_start()
         if not await self._loop.run_in_executor(None, self._ready.wait, CONNECT_TIMEOUT_S):
+            tcp = self._tcp_open.is_set()
             self._close()
-            raise ConnectionError(f"MQTT connect timeout {cfg['host']}:{cfg['port']}")
+            if not supports_socket_callback():
+                where = "no CONNACK"
+            elif tcp:
+                where = "TCP connected but the broker sent no CONNACK (credentials / clientId rejected silently?)"
+            else:
+                where = "TCP connection never established (DNS / firewall / proxy / port blocked?)"
+            raise ConnectionError(f"MQTT connect timeout {host}:{port} after {CONNECT_TIMEOUT_S:.0f}s: {where}")
 
     def _close(self) -> None:
         client, self._client = self._client, None
@@ -175,14 +206,24 @@ class MqttSession:
         if gen != self._gen:
             return
         if rc_ok(rc):
+            logger.info("[%s] CONNACK ok, subscribing to %s", self._label, self._cfg["reciveTopic"])
             client.subscribe(self._cfg["reciveTopic"], qos=1)
             self._ready.set()
         else:
             logger.error("[%s] MQTT connect refused rc=%s", self._label, rc)
-            self._cb_lost(gen)
+            self._cb_lost(gen, rc)
 
-    def _cb_lost(self, gen: int) -> None:
+    def _cb_socket(self, gen: int) -> None:
+        if gen == self._gen:
+            self._tcp_open.set()
+
+    def _cb_subscribed(self, gen: int, granted) -> None:
+        if gen == self._gen:
+            logger.info("[%s] subscribed to %s (granted=%s)", self._label, (self._cfg or {}).get("reciveTopic"), granted)
+
+    def _cb_lost(self, gen: int, rc: Any = None) -> None:
         if gen == self._gen and self._loop and not self._stopping:
+            logger.warning("[%s] MQTT connection lost (rc=%s)", self._label, rc)
             self._loop.call_soon_threadsafe(self._lost.set)
 
     def _cb_message(self, gen: int, msg) -> None:
