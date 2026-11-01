@@ -137,9 +137,9 @@ async def main():
     send_in("a", content="grp A", messageId="g1", isGroup=True, groupId="room1", groupName="R")
     send_in("b", content="grp B", messageId="g1", isGroup=True, groupId="room1", groupName="R", senderId="wxid_boss")
     assert await wait(lambda: len(events) >= 4), [(e.message_id, e.source.chat_id) for e in events]
-    ids = {(e.metadata["wms_account"], e.source.chat_id) for e in events}
-    assert ids == {("default", "wxid_u"), ("shop", "shop/wxid_boss"),
-                   ("default", "group:room1"), ("shop", "shop/group:room1")}, ids
+    ids = {e.source.chat_id for e in events}
+    assert ids == {"wxid_u", "shop/wxid_boss", "group:room1", "shop/group:room1"}, ids
+    assert not any(e.metadata.get("wms_account") for e in events), "不再往 metadata 塞自定义键（宿主的信封白名单会拦）"
     # 同 messageId 来自两个账号：去重按账号隔离，两条都处理
     assert sum(1 for e in events if e.message_id == "x1") == 2
 
@@ -150,8 +150,8 @@ async def main():
     assert await wait(lambda: len(events) >= n + 1)
     await asyncio.sleep(0.4)
     new = events[n:]
-    assert [e.message_id for e in new] == ["s2"] and new[0].metadata["wms_account"] == "default", \
-        [(e.message_id, e.metadata) for e in new]
+    assert [e.message_id for e in new] == ["s2"] and new[0].source.chat_id == "wxid_stranger", \
+        [(e.message_id, e.source.chat_id) for e in new]
 
     # ---- 同一条消息重复投递：同账号去重 ----
     n = len(events)

@@ -215,7 +215,6 @@ class WmsChatAdapter(BasePlatformAdapter):
                 message_id=m["messageId"], raw_message=m,
                 media_urls=media_urls, media_types=media_types, media_filenames=media_names,
                 reply_expected=inbound.reply_expected(m),
-                metadata={"wms_account": account},
                 timestamp=(datetime.datetime.fromtimestamp(ts / 1000)
                            if isinstance(ts, (int, float)) else datetime.datetime.now()),
             )

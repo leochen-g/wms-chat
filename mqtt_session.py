@@ -6,8 +6,10 @@ paho 在自己的线程里回调；这里把消息通过 ``run_coroutine_threads
 import asyncio
 import contextlib
 import logging
+import errno
 import random
 import secrets
+import socket
 import threading
 from typing import Any, Awaitable, Callable, Optional
 
@@ -48,6 +50,111 @@ def make_client_id(base: str) -> str:
 def supports_socket_callback() -> bool:
     import paho.mqtt.client as mqtt
     return hasattr(mqtt.Client, "on_socket_open")
+
+
+# --------------------------------------------------------------------------
+# 宿主 socket 层兼容
+# --------------------------------------------------------------------------
+# paho 建连时固定传 ``source_address=("", 0)``。原生 ``socket.create_connection`` 把它当“不绑定”；
+# 但有的 Hermes 版本给整个进程换了一个 IPv6/IPv4 竞速连接层，它会把 ("", 0) 当真实网卡去绑
+# （getaddrinfo("", 0) 失败，或绑到 IPv6 通配地址上导致 IPv4 连接报 10051）。
+# 下面这个 shim 只在 paho 建连的这一小段时间里，把“空的源地址”丢掉再交给当前的 create_connection。
+_SHIM_LOCK = threading.Lock()
+_HOST_SOCKET_ERRNOS = frozenset({
+    10051,                        # WSAENETUNREACH (Windows)：IPv4 连接被绑到了 IPv6 通配地址
+    10060,                        # WSAETIMEDOUT (Windows)
+    errno.ENETUNREACH, errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, -5, -2,  # -5/-2: getaddrinfo 的 EAI_NODATA/EAI_NONAME
+})
+
+
+_EMPTY_SOURCES = (("", 0), ("", None))
+
+
+def _drop_empty_source(real):
+    """create_connection 的包装：空的源地址（paho 固定传的 ("", 0)）改成 None。"""
+
+    def _wrapped(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *args, **kwargs):
+        if source_address in _EMPTY_SOURCES:
+            source_address = None
+        return real(address, timeout, source_address, *args, **kwargs)
+
+    _wrapped._wms_shim = True  # type: ignore[attr-defined]
+    return _wrapped
+
+
+class _paho_source_address_shim:
+    """with 块内临时包一层 ``socket.create_connection``。
+
+    原生 Python 里 ("", 0) 等于“不绑定”，所以这层对没打补丁的 Hermes 是无操作；
+    只有 ``create_connection`` 被替换成竞速实现时才起作用。进程内用锁串行化，避免并发时
+    互相恢复到对方的包装。
+    """
+
+    def __enter__(self):
+        _SHIM_LOCK.acquire()
+        self._real = socket.create_connection
+        socket.create_connection = _drop_empty_source(self._real)
+        return self
+
+    def __exit__(self, *exc):
+        socket.create_connection = self._real
+        _SHIM_LOCK.release()
+
+
+def connect_with_shim(client, host: str, port: int, keepalive: int = 60) -> None:
+    """``connect_async``，但 paho 拨号那一步（在它自己的网络线程里）走带 shim 的 create_connection。
+
+    paho 没有“传入现成 socket”的公开接口，所以包住它的拨号函数 ``_create_socket_connection``，
+    而不是在这里先拨好。包的范围只有这一次拨号，拨完立刻恢复。"""
+    original = getattr(client, "_create_socket_connection", None)
+    if original is not None:  # paho 内部改名时退化为不加 shim，行为等同原来
+
+        def _patched():
+            with _paho_source_address_shim():
+                return original()
+
+        client._create_socket_connection = _patched
+    client.connect_async(host, port, keepalive=keepalive)
+
+
+def diagnose_connect_failure(host: str, port: int, timeout: float = 5.0) -> str:
+    """TCP 没建立时的自检：用裸 socket 再拨一次，对比 ``socket.create_connection``，指出问题在哪一层。
+
+    只在失败路径上调用，成功路径零开销。返回一句给人看的原因。"""
+    raw_err: Optional[BaseException] = None
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"DNS resolution failed for {host}: {exc}"
+    for family, socktype, proto, _c, sockaddr in infos:
+        s = socket.socket(family, socktype, proto)
+        s.settimeout(timeout)
+        try:
+            s.connect(sockaddr)
+            raw_err = None
+            break
+        except OSError as exc:
+            raw_err = exc
+        finally:
+            s.close()
+    if raw_err is not None:
+        return (f"a plain socket cannot reach {host}:{port} either ({raw_err}) — "
+                "real network problem (firewall / proxy / security group / outbound port blocked)")
+    # 裸 socket 通了：再用进程里当前的 create_connection（可能被宿主替换过）拨一次
+    for src in ((), (("", 0),)):  # 无源地址 / paho 的空源地址
+        try:
+            conn = socket.create_connection((host, port), timeout, *src)
+            conn.close()
+        except OSError as exc:
+            if src and exc.errno in _HOST_SOCKET_ERRNOS or isinstance(exc, socket.gaierror):
+                return ("host socket layer problem: a plain socket reaches the broker, but "
+                        f"socket.create_connection fails with an empty source address ({exc!r}). "
+                        "Hermes' IPv6/IPv4 racing connect layer mishandles paho's source_address=('', 0); "
+                        "this plugin works around it, so if you still see this, update the plugin.")
+            return (f"a plain socket reaches {host}:{port} but socket.create_connection fails ({exc!r}) — "
+                    "something in this process patches the connect path")
+    return (f"TCP to {host}:{port} works from this process, so the failure is above TCP "
+            "(TLS / CONNACK) — check the broker's response")
 
 
 def rc_ok(rc: Any) -> bool:
@@ -157,7 +264,7 @@ class MqttSession:
         self._client = client
         logger.info("[%s] connecting to %s:%s as clientId=%s (broker clientId=%s)",
                     self._label, host, port, client_id, cfg["clientId"])
-        client.connect_async(host, port, keepalive=60)
+        connect_with_shim(client, host, port, keepalive=60)
         client.loop_start()
         if not await self._loop.run_in_executor(None, self._ready.wait, CONNECT_TIMEOUT_S):
             tcp = self._tcp_open.is_set()
@@ -167,7 +274,8 @@ class MqttSession:
             elif tcp:
                 where = "TCP connected but the broker sent no CONNACK (credentials / clientId rejected silently?)"
             else:
-                where = "TCP connection never established (DNS / firewall / proxy / port blocked?)"
+                # TCP 没建立：别直接怪网络，先用裸 socket 自检，分清是宿主 socket 层还是真的网络问题
+                where = await self._loop.run_in_executor(None, diagnose_connect_failure, host, port)
             raise ConnectionError(f"MQTT connect timeout {host}:{port} after {CONNECT_TIMEOUT_S:.0f}s: {where}")
 
     def _close(self) -> None:

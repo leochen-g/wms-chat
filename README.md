@@ -197,6 +197,8 @@ wms-chat/
 ├── gateway_env.py     授权环境变量名
 └── tests/
     ├── test_e2e.py            单账号端到端测试
+    ├── test_client_id.py      clientId 随机后缀、连接超时诊断
+    ├── test_host_socket.py    宿主 socket 层兼容（复现 + 绕过）
     └── test_multi_account.py  多账号端到端测试
 ```
 
@@ -210,6 +212,17 @@ HERMES_HOME=/tmp/h PYTHONPATH=<hermes-agent 源码目录> python tests/test_mult
 ```
 
 测试使用真实的 Hermes 基类 + 本地 HTTP 配置服务 + 本地 MQTT broker。`test_e2e.py` 覆盖入站（私聊/群聊/去重/过滤）、出站 payload、媒体落盘、断线重连、cron standalone 发送；`test_multi_account.py` 覆盖账号配置解析、会话隔离、按账号的访问控制和出站路由、单账号重连互不影响、跨进程 apiKey 锁、cron 选账号。
+
+## 已知的宿主（Hermes）问题
+
+这两个都是 Hermes 主干的问题，插件是受害者；插件已各自绕过，用户无需操作。
+
+1. **IPv6/IPv4 竞速连接层误绑本地地址。** Hermes 给整个进程装了一个 Happy Eyeballs 式的 `socket.create_connection`。paho 建连时固定传 `source_address=("", 0)`，原生 Python 里这是"不绑定"，竞速层却把它当真实网卡去绑（`getaddrinfo("", 0)` 失败，或绑到 IPv6 通配地址上使 IPv4 连接报 `10051`）。凡是走 paho 或裸 socket 的插件都会中招。
+   - 插件的处理：`mqtt_session.connect_with_shim` 只在 paho 拨号的那一刻把空源地址丢掉，拨完立即恢复；原生 Python 上是无操作。
+   - 连接失败时，日志会先用裸 socket 自检，区分"宿主 socket 层问题"和"真正的网络问题"，不再笼统地说"DNS / 防火墙 / 代理"。
+2. **入站信封的 `metadata` 是封闭白名单**（目前只登记了 WhatsApp 的键），插件往 `MessageEvent.metadata` 放自定义键会被 `invalid_params` 拦掉。插件的处理：不往 `metadata` 写任何键。多账号靠 chat_id 的 `<账号名>/` 前缀区分，不依赖 metadata。
+
+测试：`tests/test_host_socket.py` 用 Hermes 源码里的真实竞速实现复现问题并验证绕过（设置 `HERMES_SRC` 指向 Hermes 源码目录；不设则用等价的内置实现）。
 
 ## 已知限制
 

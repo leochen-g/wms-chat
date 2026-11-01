@@ -74,7 +74,7 @@ async def main():
     sess = ms.MqttSession(fetch_config=lambda: dict(CFG, port=str(dead)), on_message=noop, on_exhausted=noop,
                           max_attempts=1, base_delay=0.1, label="t")
     try: await sess.start(); raise SystemExit("should have timed out")
-    except ConnectionError as e: assert "TCP connection never established" in str(e), e; print("closed port ->", e)
+    except ConnectionError as e: assert "plain socket cannot reach" in str(e) and "real network problem" in str(e), e; print("closed port ->", e)
 
     # 6) 超时诊断：TCP 通但 broker 不回 CONNACK -> 提示的是另一种原因
     mute = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
